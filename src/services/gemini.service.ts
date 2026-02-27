@@ -4,9 +4,17 @@ import { uploadFrame } from './s3.service'
 import OpenAI from 'openai'
 
 async function getAccessToken(): Promise<string> {
-  const auth = new GoogleAuth({
-    scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-  })
+  const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_KEY
+
+  const auth = keyJson
+    ? new GoogleAuth({
+        credentials: JSON.parse(keyJson),
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+      })
+    : new GoogleAuth({
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+      })
+
   const client = await auth.getClient()
   const token = await client.getAccessToken()
   if (!token.token) throw new Error('Failed to get access token')
