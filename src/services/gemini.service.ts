@@ -1,6 +1,7 @@
 import WebSocket from 'ws'
 import { GoogleAuth } from 'google-auth-library'
-import { uploadFrame, uploadAudio } from './s3.service'
+import { uploadFrame } from './s3.service'
+import OpenAI from 'openai'
 
 async function getAccessToken(): Promise<string> {
   const auth = new GoogleAuth({
@@ -13,6 +14,7 @@ async function getAccessToken(): Promise<string> {
 }
 
 function buildSystemPrompt(session: any): string {
+  const isContinuation = Array.isArray(session.transcript) && session.transcript.length > 0
   return `You are an expert knowledge transfer interviewer conducting a structured KT session.
 
 EMPLOYEE: ${session.employeeName}
@@ -24,8 +26,12 @@ TOPICS THAT MUST BE COVERED:
 ${session.topics.map((t: string, i: number) => `${i + 1}. ${t}`).join('\n')}
 
 YOUR BEHAVIOUR:
-- Start by greeting ${session.employeeName} and explaining the session purpose
-- Do not wait for the employee to speak first — begin immediately
+- ${isContinuation
+    ? `This is a continuation of an existing session. Do NOT greet again. Resume naturally from where the prior conversation stopped.`
+    : `Start by greeting ${session.employeeName} and explaining the session purpose.`}
+- ${isContinuation
+    ? `Continue directly with follow-up questions based on the existing context and remaining topics.`
+    : `Do not wait for the employee to speak first — begin immediately.`}
 - Work through each topic systematically — do not skip any
 - Ask follow-up questions when answers are vague
 - Push for edge cases: "What breaks? What only you know?"
@@ -38,16 +44,87 @@ STRICT RULES:
 - NEVER generate a document during the session
 - NEVER summarise the session while it is still running
 - Your ONLY job is to INTERVIEW and EXTRACT knowledge
-- When employee says they are done, thank them and close naturally`
+- When employee says they are done, thank them and close naturally
+- RESPOND UNMISTAKABLY IN ENGLISH ONLY
+- If the employee speaks another language, understand it and continue the interview in English
+- Keep all AI responses and clarifying questions in English`
 }
 
+// ── Better hash: samples multiple positions across the full string ──────────
 function simpleHash(str: string): number {
-  let hash = 0
-  for (let i = 0; i < Math.min(str.length, 100); i++) {
+  const len = str.length
+  const step = Math.max(1, Math.floor(len / 50)) // sample ~50 points spread across entire string
+  let hash = len // include length so differently-sized images always differ
+  for (let i = 0; i < len; i += step) {
     hash = (hash << 5) - hash + str.charCodeAt(i)
     hash = hash & hash
   }
   return hash
+}
+
+// ── Convert document JSON → clean HTML for the Notion-like editor ────────────
+export function documentToHtml(doc: any): string {
+  function esc(s: string): string {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+  }
+  function paragraphs(text: string): string {
+    return text
+      .split(/\n+/)
+      .filter(Boolean)
+      .map((p) => `<p>${esc(p)}</p>`)
+      .join('')
+  }
+
+  let html = `<h1>${esc(doc.title)}</h1>`
+
+  if (doc.executiveSummary) {
+    html += `<h2>Executive Summary</h2>${paragraphs(doc.executiveSummary)}`
+  }
+
+  if (Array.isArray(doc.sections)) {
+    for (const section of doc.sections) {
+      html += `<h2>${esc(section.heading)}</h2>`
+      if (section.content) html += paragraphs(section.content)
+      if (section.gaps) {
+        html += `<blockquote><strong>Gaps: </strong>${esc(section.gaps)}</blockquote>`
+      }
+    }
+  }
+
+  if (Array.isArray(doc.criticalKnowledge) && doc.criticalKnowledge.length > 0) {
+    html += `<h2>Critical Knowledge</h2><ul>`
+    for (const item of doc.criticalKnowledge) html += `<li>${esc(item)}</li>`
+    html += `</ul>`
+  }
+
+  if (Array.isArray(doc.handoverRisks) && doc.handoverRisks.length > 0) {
+    html += `<h2>Handover Risks</h2><ul>`
+    for (const risk of doc.handoverRisks) html += `<li>${esc(risk)}</li>`
+    html += `</ul>`
+  }
+
+  if (Array.isArray(doc.gaps) && doc.gaps.length > 0) {
+    html += `<h2>Knowledge Gaps</h2><ul>`
+    for (const gap of doc.gaps) html += `<li>${esc(gap)}</li>`
+    html += `</ul>`
+  }
+
+  if (Array.isArray(doc.recommendedActions) && doc.recommendedActions.length > 0) {
+    html += `<h2>Recommended Next Steps</h2><ol>`
+    for (const action of doc.recommendedActions) html += `<li>${esc(action)}</li>`
+    html += `</ol>`
+  }
+
+  if (Array.isArray(doc.followUpQuestions) && doc.followUpQuestions.length > 0) {
+    html += `<h2>Follow-up Questions</h2><ol>`
+    for (const q of doc.followUpQuestions) html += `<li>${esc(q)}</li>`
+    html += `</ol>`
+  }
+
+  return html
 }
 
 export async function handleSessionWebSocket(
@@ -64,40 +141,70 @@ export async function handleSessionWebSocket(
 
   await db.collection('sessions').updateOne(
     { inviteToken },
-    { $set: { status: 'active', startedAt: new Date() } }
+    { $set: { status: 'active', startedAt: session.startedAt || new Date(), endedAt: null } }
   )
 
   let geminiWs: WebSocket | null = null
   let resumptionToken: string | null = null
   let reconnectAttempts = 0
   let lastFrameHash: number | null = null
+  let sessionTerminated = false // ← prevents Gemini from reconnecting after session ends
+  let explicitSessionEndRequested = false
   const MAX_RECONNECTS = 5
 
-  async function saveTranscriptChunk(chunk: any) {
-    await db.collection('sessions').updateOne(
+  // ── Transcript buffering — merge until speaker changes ──────
+  let transcriptBuffer: { speaker: string; text: string } | null = null
+
+  function flushTranscriptBuffer() {
+    if (!transcriptBuffer) return
+    const chunk = {
+      speaker: transcriptBuffer.speaker,
+      text: transcriptBuffer.text.trim(),
+      timestamp: new Date(),
+    }
+    if (!chunk.text) {
+      transcriptBuffer = null
+      return
+    }
+    db.collection('sessions').updateOne(
       { inviteToken },
       {
         $push: { transcript: chunk },
         $set: { lastActivity: new Date() },
       }
     )
+    browserWs.send(JSON.stringify({
+      type: 'transcript',
+      speaker: chunk.speaker,
+      text: chunk.text,
+    }))
+    transcriptBuffer = null
   }
 
-  // Upload to S3 and save URL in MongoDB
+  function bufferTranscript(speaker: string, text: string) {
+    if (transcriptBuffer && transcriptBuffer.speaker === speaker) {
+      transcriptBuffer.text += text
+    } else {
+      flushTranscriptBuffer()
+      transcriptBuffer = { speaker, text }
+    }
+  }
+
+  // ── Frame upload ─────────────────────────────────────────────
   async function saveFrameIfChanged(jpegBase64: string, timestamp: number) {
     const hash = simpleHash(jpegBase64)
-    if (hash === lastFrameHash) return
+    if (hash === lastFrameHash) {
+      console.log(`[${inviteToken.slice(0, 8)}] Frame unchanged — skipping`)
+      return
+    }
     lastFrameHash = hash
 
+    console.log(`[${inviteToken.slice(0, 8)}] Frame changed — uploading to S3...`)
     try {
       const s3Url = await uploadFrame(inviteToken, jpegBase64, timestamp)
       await db.collection('sessions').updateOne(
         { inviteToken },
-        {
-          $push: {
-            frames: { url: s3Url, timestamp }  // URL not base64
-          }
-        }
+        { $push: { frames: { url: s3Url, timestamp } } }
       )
       console.log(`[${inviteToken.slice(0, 8)}] Frame saved: ${s3Url}`)
     } catch (err: any) {
@@ -107,12 +214,11 @@ export async function handleSessionWebSocket(
 
   async function connectToGemini(token: string | null = null) {
     const PROJECT_ID = process.env.GEMINI_PROJECT_ID
-    const LOCATION = process.env.GEMINI_LOCATION
-    const MODEL = process.env.GEMINI_MODEL
+    const LOCATION   = process.env.GEMINI_LOCATION
+    const MODEL      = process.env.GEMINI_MODEL
     const GEMINI_URL = `wss://${LOCATION}-aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1beta1.LlmBidiService/BidiGenerateContent`
 
     const ACCESS_TOKEN = await getAccessToken()
-
     console.log(`[${inviteToken.slice(0, 8)}] Connecting to Gemini...`)
 
     geminiWs = new WebSocket(GEMINI_URL, {
@@ -129,6 +235,7 @@ export async function handleSessionWebSocket(
           generation_config: {
             response_modalities: ['AUDIO'],
             speech_config: {
+              language_code: 'en-US',
               voice_config: {
                 prebuilt_voice_config: { voice_name: 'Aoede' },
               },
@@ -153,6 +260,7 @@ export async function handleSessionWebSocket(
     geminiWs.onmessage = (event) => {
       const data = JSON.parse(event.data.toString())
 
+      // AI audio
       if (data.serverContent?.modelTurn?.parts) {
         data.serverContent.modelTurn.parts.forEach((part: any) => {
           if (part.inlineData?.mimeType === 'audio/pcm') {
@@ -162,35 +270,42 @@ export async function handleSessionWebSocket(
         browserWs.send(JSON.stringify({ type: 'ai_speaking', value: true }))
       }
 
+      // AI turn complete — flush AI transcript buffer
       if (data.serverContent?.turnComplete) {
+        flushTranscriptBuffer()
         browserWs.send(JSON.stringify({ type: 'ai_speaking', value: false }))
       }
 
+      // Employee transcript
       if (data.serverContent?.inputTranscription?.text) {
-        const text = data.serverContent.inputTranscription.text
-        const chunk = { speaker: 'employee', text, timestamp: new Date() }
-        saveTranscriptChunk(chunk)
-        browserWs.send(JSON.stringify({ type: 'transcript', speaker: 'employee', text }))
+        bufferTranscript('employee', data.serverContent.inputTranscription.text)
       }
 
+      // AI transcript
       if (data.serverContent?.outputTranscription?.text) {
-        const text = data.serverContent.outputTranscription.text
-        const chunk = { speaker: 'ai', text, timestamp: new Date() }
-        saveTranscriptChunk(chunk)
-        browserWs.send(JSON.stringify({ type: 'transcript', speaker: 'ai', text }))
+        bufferTranscript('ai', data.serverContent.outputTranscription.text)
       }
 
+      // Resumption token
       if (data.sessionResumptionUpdate?.newHandle) {
         resumptionToken = data.sessionResumptionUpdate.newHandle
+        db.collection('sessions').updateOne(
+          { inviteToken },
+          { $set: { resumptionHandle: resumptionToken } }
+        ).catch(() => {})
       }
     }
 
     geminiWs.onclose = (event) => {
-      console.log(`[${inviteToken.slice(0, 8)}] Gemini closed: ${event.code} — reason: ${event.reason}`)
+      console.log(`[${inviteToken.slice(0, 8)}] Gemini closed: ${event.code}`)
+      // ← Do NOT reconnect if the session was intentionally ended by the employee
+      if (sessionTerminated) {
+        console.log(`[${inviteToken.slice(0, 8)}] Session terminated — skipping Gemini reconnect`)
+        return
+      }
       if (reconnectAttempts < MAX_RECONNECTS) {
         reconnectAttempts++
-        const delay = reconnectAttempts * 2000
-        setTimeout(() => connectToGemini(resumptionToken), delay)
+        setTimeout(() => connectToGemini(resumptionToken), reconnectAttempts * 2000)
       } else {
         browserWs.send(JSON.stringify({ type: 'session_ended', reason: 'max_reconnects' }))
       }
@@ -201,29 +316,70 @@ export async function handleSessionWebSocket(
     }
   }
 
-  browserWs.on('message', (message) => {
-    const data = JSON.parse(message.toString())
+  // ── Browser → Gemini ────────────────────────────────────────
+  browserWs.on('message', async (message) => {
+    try {
+      const data = JSON.parse(message.toString())
 
-    if (data.realtime_input?.media_chunks) {
-      data.realtime_input.media_chunks.forEach((chunk: any) => {
-        if (chunk.mime_type === 'image/jpeg') {
-          saveFrameIfChanged(chunk.data, Date.now())
+      if (data.type === 'end_session') {
+        console.log(`[${inviteToken.slice(0, 8)}] Explicit end_session received`)
+        explicitSessionEndRequested = true
+        sessionTerminated = true
+        flushTranscriptBuffer()
+
+        if (geminiWs?.readyState === WebSocket.OPEN) {
+          geminiWs.close()
         }
-      })
-    }
 
-    if (geminiWs?.readyState === WebSocket.OPEN) {
-      geminiWs.send(JSON.stringify(data))
+        await db.collection('sessions').updateOne(
+          { inviteToken },
+          { $set: { status: 'ended', endedAt: new Date() } }
+        )
+
+        browserWs.send(JSON.stringify({ type: 'session_ended', reason: 'user_ended' }))
+        return
+      }
+
+      // Handle frames
+      if (data.realtime_input?.media_chunks) {
+        for (const chunk of data.realtime_input.media_chunks) {
+          if (chunk.mime_type === 'image/jpeg') {
+            console.log(`[${inviteToken.slice(0, 8)}] Image chunk received, size: ${chunk.data?.length ?? 0}`)
+            await saveFrameIfChanged(chunk.data, Date.now())
+          }
+        }
+      }
+
+      // Forward everything to Gemini
+      if (geminiWs?.readyState === WebSocket.OPEN) {
+        geminiWs.send(JSON.stringify(data))
+      }
+    } catch (err: any) {
+      console.error(`[${inviteToken.slice(0, 8)}] Message parse error:`, err.message)
     }
   })
 
+  // ── Browser disconnected ────────────────────────────────────
   browserWs.on('close', async () => {
-    console.log(`[${inviteToken.slice(0, 8)}] Browser disconnected`)
+    console.log(`[${inviteToken.slice(0, 8)}] Browser disconnected — ending session`)
+
+    sessionTerminated = true // ← stops Gemini from reconnecting
+
+    flushTranscriptBuffer()
+
     if (geminiWs) geminiWs.close()
+
+    if (explicitSessionEndRequested) {
+      await db.collection('sessions').updateOne(
+        { inviteToken },
+        { $set: { status: 'ended', endedAt: new Date() } }
+      )
+      return
+    }
 
     await db.collection('sessions').updateOne(
       { inviteToken },
-      { $set: { status: 'processing', endedAt: new Date() } }
+      { $set: { status: 'processing', endedAt: new Date(), resumptionHandle: null } }
     )
 
     generateDocument(inviteToken, db)
@@ -233,18 +389,16 @@ export async function handleSessionWebSocket(
     console.error(`[${inviteToken.slice(0, 8)}] Browser WS error:`, err.message)
   })
 
-  connectToGemini()
+  connectToGemini(session.resumptionHandle || null)
 }
 
+// ── Document generation via OpenAI ──────────────────────────────────────────
 async function generateDocument(inviteToken: string, db: any) {
-  const PROJECT_ID = process.env.GEMINI_PROJECT_ID
-  const LOCATION = process.env.GEMINI_LOCATION
-
-  console.log(`[${inviteToken.slice(0, 8)}] Generating document...`)
+  console.log(`[${inviteToken.slice(0, 8)}] Generating document via OpenAI...`)
   try {
     const session = await db.collection('sessions').findOne({ inviteToken })
-    if (!session || session.transcript.length === 0) {
-      console.log('No transcript — skipping')
+    if (!session || !session.transcript || session.transcript.length === 0) {
+      console.log(`[${inviteToken.slice(0, 8)}] No transcript — skipping document generation`)
       return
     }
 
@@ -252,63 +406,64 @@ async function generateDocument(inviteToken: string, db: any) {
       .map((c: any) => `${c.speaker.toUpperCase()}: ${c.text}`)
       .join('\n')
 
-    const prompt = `You are a technical documentation specialist.
+    const prompt = `You are a senior technical documentation specialist creating a high-level Knowledge Transfer (KT) document.
 
-Employee: ${session.employeeName}, Role: ${session.role}
-Interview type: ${session.interviewType}
-Goal: ${session.interviewGoal}
-Topics: ${session.topics.join(', ')}
+SESSION DETAILS:
+- Employee: ${session.employeeName}
+- Role: ${session.role}
+- Interview Type: ${session.interviewType}
+- Goal: ${session.interviewGoal}
+- Topics to cover: ${session.topics.join(', ')}
 
 TRANSCRIPT:
 ${transcriptText}
 
-Generate a comprehensive knowledge document. Output ONLY valid JSON:
+Create a comprehensive, professional KT document suitable for a new hire or successor to understand this role deeply.
+
+Return ONLY valid JSON with this exact structure:
 {
-  "title": "...",
-  "sections": [{ "heading": "...", "content": "...", "gaps": "..." }],
-  "criticalKnowledge": ["..."],
-  "gaps": ["..."],
-  "followUpQuestions": ["..."]
+  "title": "Knowledge Transfer: [Role] — [Employee Name]",
+  "executiveSummary": "A 3-4 sentence high-level summary of what was captured, why this role matters, and what the successor needs to know most urgently.",
+  "sections": [
+    {
+      "heading": "Section title based on topics covered",
+      "content": "Detailed, multi-paragraph prose. Include specifics, not vague statements. Cover edge cases, tribal knowledge, and anything that only this person knows. Write as if onboarding someone with zero context.",
+      "gaps": "Any areas in this topic that were not fully explained or need follow-up (empty string if none)"
+    }
+  ],
+  "criticalKnowledge": ["Bullet points of the most critical, hard-to-discover things learned"],
+  "handoverRisks": ["Specific risks if this knowledge is not transferred properly"],
+  "gaps": ["Overall knowledge gaps that still need documentation"],
+  "recommendedActions": ["Concrete next steps for the receiving team or manager"],
+  "followUpQuestions": ["Questions to ask in a follow-up session to fill gaps"]
 }`
 
-    const ACCESS_TOKEN = await getAccessToken()
-    const https = await import('https')
-    const requestBody = JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.3, responseMimeType: 'application/json' },
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are a technical documentation specialist. Always return valid JSON only, no markdown fences.',
+        },
+        { role: 'user', content: prompt },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.3,
     })
 
-    const options = {
-      hostname: `${LOCATION}-aiplatform.googleapis.com`,
-      path: `/v1/projects/${PROJECT_ID}/locations/${LOCATION}/publishers/google/models/gemini-2.0-flash:generateContent`,
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(requestBody),
-      },
-    }
-
-    const response = await new Promise<any>((resolve, reject) => {
-      const req = https.default.request(options, (res) => {
-        let data = ''
-        res.on('data', (chunk) => (data += chunk))
-        res.on('end', () => resolve(JSON.parse(data)))
-      })
-      req.on('error', reject)
-      req.write(requestBody)
-      req.end()
-    })
-
-    const generatedText = response.candidates?.[0]?.content?.parts?.[0]?.text
-    if (!generatedText) throw new Error('No content in response')
+    const generatedText = completion.choices[0]?.message?.content
+    if (!generatedText) throw new Error('No content in OpenAI response')
 
     const document = JSON.parse(generatedText)
+    const documentHtml = documentToHtml(document)
+
     await db.collection('sessions').updateOne(
       { inviteToken },
-      { $set: { document, status: 'completed' } }
+      { $set: { document, documentHtml, status: 'completed' } }
     )
-    console.log(`[${inviteToken.slice(0, 8)}] Document generated`)
+    console.log(`[${inviteToken.slice(0, 8)}] Document generated successfully`)
   } catch (err: any) {
     console.error(`[${inviteToken.slice(0, 8)}] Document generation failed:`, err.message)
     await db.collection('sessions').updateOne(
@@ -318,8 +473,7 @@ Generate a comprehensive knowledge document. Output ONLY valid JSON:
   }
 }
 
-export async function generateDocumentById(sessionId: string, inviteToken: string) {
-  // Reuse existing generateDocument function
+export async function generateDocumentById(sessionId: string, inviteToken: string): Promise<void> {
   const mongoose = await import('mongoose')
   const db = mongoose.default.connection.db
   await generateDocument(inviteToken, db)

@@ -11,8 +11,10 @@ export type InterviewType =
 export type SessionStatus =
   | "pending"
   | "active"
+  | "ended"
   | "processing"
   | "completed"
+  | "cancelled"
   | "failed";
 
 export interface ITranscriptChunk {
@@ -28,13 +30,16 @@ export interface IFrame {
 
 export interface IDocument {
   title: string;
+  executiveSummary?: string;
   sections: {
     heading: string;
     content: string;
-    gaps: string;
+    gaps?: string;
   }[];
   criticalKnowledge: string[];
+  handoverRisks?: string[];
   gaps: string[];
+  recommendedActions?: string[];
   followUpQuestions: string[];
 }
 
@@ -54,8 +59,10 @@ export interface ISession extends Document {
   frames: IFrame[];
   audioUrl: string | null;
   document: IDocument | null;
+  documentHtml: string | null;
   startedAt: Date | null;
   endedAt: Date | null;
+  resumptionHandle: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -80,6 +87,7 @@ const frameSchema = new Schema<IFrame>(
 const documentSchema = new Schema<IDocument>(
   {
     title: { type: String },
+    executiveSummary: { type: String },
     sections: [
       {
         heading: String,
@@ -88,7 +96,9 @@ const documentSchema = new Schema<IDocument>(
       },
     ],
     criticalKnowledge: [String],
+    handoverRisks: [String],
     gaps: [String],
+    recommendedActions: [String],
     followUpQuestions: [String],
   },
   { _id: false },
@@ -153,7 +163,7 @@ const sessionSchema = new Schema<ISession>(
     },
     status: {
       type: String,
-      enum: ["pending", "active", "processing", "completed", "failed"],
+      enum: ["pending", "active", "ended", "processing", "completed", "cancelled", "failed"],
       default: "pending",
     },
     transcript: {
@@ -168,6 +178,10 @@ const sessionSchema = new Schema<ISession>(
       type: documentSchema,
       default: null,
     },
+    documentHtml: {
+      type: String,
+      default: null,
+    },
     audioUrl: {
       type: String,
       default: null,
@@ -178,6 +192,10 @@ const sessionSchema = new Schema<ISession>(
     },
     endedAt: {
       type: Date,
+      default: null,
+    },
+    resumptionHandle: {
+      type: String,
       default: null,
     },
   },

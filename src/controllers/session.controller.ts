@@ -115,8 +115,8 @@ export const getSessionByToken = async (req: AuthRequest, res: Response): Promis
       return
     }
 
-    if (session.status === 'completed') {
-      res.status(400).json({ message: 'This session has already been completed' })
+    if (session.status === 'completed' || session.status === 'cancelled') {
+      res.status(400).json({ message: 'This session is no longer available' })
       return
     }
 
@@ -158,6 +158,47 @@ export const uploadSessionAudio = async (req: AuthRequest, res: Response): Promi
   }
 }
 
+// POST /api/sessions/finalize (public — called by employee after explicit end)
+export const finalizeSessionByInvite = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { inviteToken, action } = req.body as {
+      inviteToken?: string
+      action?: 'generate_partial' | 'discard'
+    }
+
+    if (!inviteToken || (action !== 'generate_partial' && action !== 'discard')) {
+      res.status(400).json({ message: 'inviteToken and valid action are required' })
+      return
+    }
+
+    const session = await Session.findOne({ inviteToken })
+    if (!session) {
+      res.status(404).json({ message: 'Session not found' })
+      return
+    }
+
+    if (action === 'discard') {
+      await Session.updateOne(
+        { inviteToken },
+        { $set: { status: 'cancelled', endedAt: session.endedAt || new Date(), resumptionHandle: null } }
+      )
+      res.status(200).json({ success: true, status: 'cancelled' })
+      return
+    }
+
+    // action === 'generate_partial'
+    await Session.updateOne(
+      { inviteToken },
+      { $set: { status: 'processing', endedAt: session.endedAt || new Date(), resumptionHandle: null } }
+    )
+    generateDocumentById(session._id.toString(), session.inviteToken)
+    res.status(202).json({ success: true, status: 'processing' })
+  } catch (err) {
+    console.error('finalizeSessionByInvite error:', (err as Error).message)
+    res.status(500).json({ message: 'Failed to finalize session' })
+  }
+}
+
 // Multer config — memory storage, 100MB limit
 export const audioUpload = multer({
   storage: multer.memoryStorage(),
@@ -170,6 +211,33 @@ export const audioUpload = multer({
     }
   }
 })
+
+// PATCH /api/sessions/:id/document — save edited document HTML
+export const saveDocumentHtml = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { html } = req.body
+    if (typeof html !== 'string') {
+      res.status(400).json({ message: 'html field is required' })
+      return
+    }
+
+    const session = await Session.findOneAndUpdate(
+      { _id: req.params.id, workspaceId: req.user?.workspaceId },
+      { $set: { documentHtml: html } },
+      { new: true }
+    )
+
+    if (!session) {
+      res.status(404).json({ message: 'Session not found' })
+      return
+    }
+
+    res.status(200).json({ success: true })
+  } catch (err) {
+    console.error('saveDocumentHtml error:', (err as Error).message)
+    res.status(500).json({ message: 'Failed to save document' })
+  }
+}
 
 // POST /api/sessions/:id/generate
 export const generateSessionDocument = async (req: AuthRequest, res: Response): Promise<void> => {
