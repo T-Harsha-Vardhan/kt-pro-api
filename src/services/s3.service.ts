@@ -26,7 +26,6 @@ export async function uploadFrame(
     Key: key,
     Body: buffer,
     ContentType: 'image/jpeg',
-    ACL: 'public-read',
   }))
 
   return `https://${bucket}.s3.${region}.amazonaws.com/${key}`
